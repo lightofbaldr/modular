@@ -66,6 +66,9 @@ from linalg.utils import (
 from std.utils.index import Index, IndexList
 from linalg.matmul.vendor.blas import matmul
 from std.memory import bitcast
+from std.sys._assembly import inlined_assembly
+from std.sys import _RegisterPackType
+from std.os.env import getenv
 from std.gpu.sync import named_barrier
 from std.gpu.intrinsics import warpgroup_reg_dealloc
 from std.gpu.host.nvidia.tma import TensorMapSwizzle
@@ -1593,6 +1596,189 @@ def block_scaled_matmul_with_epilogue[
 
 
 @always_inline
+@always_inline
+def _ld_fp4_u32[
+    dt: DType, lay: Layout
+](
+    t: LayoutTensor[dt, lay, ImmutAnyOrigin], row: Int, col_elem: Int, lim: Int
+) -> UInt32:
+    # Load 4 packed FP4 bytes (8 e2m1) as a b32 from t[row, col_elem//2 : +4].
+    # Out-of-range rows contribute zero (masked tile).
+    if row >= lim:
+        return UInt32(0)
+    var base = col_elem >> 1
+    return (
+        UInt32(Int(rebind[UInt8](t[row, base])))
+        | (UInt32(Int(rebind[UInt8](t[row, base + 1]))) << 8)
+        | (UInt32(Int(rebind[UInt8](t[row, base + 2]))) << 16)
+        | (UInt32(Int(rebind[UInt8](t[row, base + 3]))) << 24)
+    )
+
+
+@always_inline
+def _pack_sf[
+    SF_VECTOR_SIZE: Int, sdt: DType, slay: Layout
+](
+    scales: LayoutTensor[sdt, slay, ImmutAnyOrigin], row: Int, k0: Int, lim: Int
+) -> UInt32:
+    # Pack the 4 per-block e4m3 scale factors for this k64 chunk into a b32
+    # (byte b = block b), reading the swizzled SF tensor via get_scale_factor.
+    if row >= lim:
+        return UInt32(0)
+    var p = UInt32(0)
+
+    @parameter
+    for bb in range(4):
+        var s = get_scale_factor[SF_VECTOR_SIZE=SF_VECTOR_SIZE](
+            scales, row, k0 + bb * 16
+        )
+        var byte = bitcast[DType.uint8, 1](s)
+        p |= UInt32(Int(byte[0])) << (8 * bb)
+    return p
+
+
+@always_inline
+def _store_c[
+    cdt: DType, clay: Layout
+](
+    c: LayoutTensor[cdt, clay, MutAnyOrigin], row: Int, col: Int, val: Float32,
+    M: Int, N: Int,
+):
+    if row < M and col < N:
+        c[row, col] = rebind[Scalar[cdt]](val.cast[cdt]())
+
+
+@__name(t"block_scaled_fp4_tc_kernel")
+def block_scaled_fp4_tc_kernel[
+    c_type: DType,
+    a_type: DType,
+    b_type: DType,
+    a_scales_type: DType,
+    b_scales_type: DType,
+    a_layout: Layout,
+    b_layout: Layout,
+    c_layout: Layout,
+    a_scale_layout: Layout,
+    b_scale_layout: Layout,
+    SF_VECTOR_SIZE: Int,
+](
+    c: LayoutTensor[c_type, c_layout, MutAnyOrigin],
+    a: LayoutTensor[a_type, a_layout, ImmutAnyOrigin],
+    b: LayoutTensor[b_type, b_layout, ImmutAnyOrigin],
+    a_scales: LayoutTensor[a_scales_type, a_scale_layout, ImmutAnyOrigin],
+    b_scales: LayoutTensor[b_scales_type, b_scale_layout, ImmutAnyOrigin],
+    alpha: Float32,
+):
+    # NVFP4 tensor-core GEMM for consumer Blackwell (sm_121 / GB10): one warp
+    # computes a 16x8 output tile via the native mma.sync.m16n8k64 block_scale
+    # FP4 instruction. A/B are K-major uint8 (2 e2m1/byte); scales are the 5D
+    # TCGEN-swizzled SF tensors (read through get_scale_factor).
+    var M = Int(c.dim(0))
+    var N = Int(c.dim(1))
+    var K = Int(a.dim(1)) * 2
+    var lane = Int(thread_idx.x)
+    var gid = lane >> 2
+    var tid = lane & 3
+    var mrow = Int(block_idx.y) * 16
+    var ncol = Int(block_idx.x) * 8
+
+    var c0 = Float32(0)
+    var c1 = Float32(0)
+    var c2 = Float32(0)
+    var c3 = Float32(0)
+
+    for k0 in range(0, K, 64):
+        var a0 = _ld_fp4_u32(a, mrow + gid, k0 + tid * 8, M)
+        var a1 = _ld_fp4_u32(a, mrow + gid + 8, k0 + tid * 8, M)
+        var a2 = _ld_fp4_u32(a, mrow + gid, k0 + tid * 8 + 32, M)
+        var a3 = _ld_fp4_u32(a, mrow + gid + 8, k0 + tid * 8 + 32, M)
+        var b0 = _ld_fp4_u32(b, ncol + gid, k0 + tid * 8, N)
+        var b1 = _ld_fp4_u32(b, ncol + gid, k0 + tid * 8 + 32, N)
+
+        var sca = UInt32(0)
+        if tid == 0:
+            sca = _pack_sf[SF_VECTOR_SIZE](a_scales, mrow + gid, k0, M)
+        elif tid == 1:
+            sca = _pack_sf[SF_VECTOR_SIZE](a_scales, mrow + gid + 8, k0, M)
+        var scb = UInt32(0)
+        if tid == 0:
+            scb = _pack_sf[SF_VECTOR_SIZE](b_scales, ncol + gid, k0, N)
+
+        var r = inlined_assembly[
+            (
+                "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale"
+                ".scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 {$0,$1,$2,$3},"
+                " {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13}, {$14}, {0, 0},"
+                " {$15}, {0, 0};"
+            ),
+            _RegisterPackType[Float32, Float32, Float32, Float32],
+            constraints="=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f,r,r",
+        ](a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, sca, scb)
+        c0 = r[0]
+        c1 = r[1]
+        c2 = r[2]
+        c3 = r[3]
+
+    _store_c(c, mrow + gid, ncol + 2 * tid, c0 * alpha, M, N)
+    _store_c(c, mrow + gid, ncol + 2 * tid + 1, c1 * alpha, M, N)
+    _store_c(c, mrow + gid + 8, ncol + 2 * tid, c2 * alpha, M, N)
+    _store_c(c, mrow + gid + 8, ncol + 2 * tid + 1, c3 * alpha, M, N)
+
+
+def tc_block_scaled_matmul[
+    c_type: DType,
+    a_type: DType,
+    b_type: DType,
+    a_scales_type: DType,
+    b_scales_type: DType,
+    //,
+    *,
+    SF_VECTOR_SIZE: Int,
+    transpose_b: Bool = True,
+](
+    c: LayoutTensor[c_type, address_space=AddressSpace.GENERIC, ...],
+    a: LayoutTensor[a_type, address_space=AddressSpace.GENERIC, ...],
+    b: LayoutTensor[b_type, address_space=AddressSpace.GENERIC, ...],
+    a_scales: LayoutTensor[
+        a_scales_type, address_space=AddressSpace.GENERIC, ...
+    ],
+    b_scales: LayoutTensor[
+        b_scales_type, address_space=AddressSpace.GENERIC, ...
+    ],
+    ctx: DeviceContext,
+    alpha: Float32 = 1.0,
+) raises:
+    comptime assert transpose_b, "Only transpose_b=True supported"
+    var M = c.dim(0)
+    var N = c.dim(1)
+    if M == 0 or N == 0:
+        return
+    logger.info("Executing NVFP4 tensor-core GEMM (sm_121)")
+    comptime kernel = block_scaled_fp4_tc_kernel[
+        c_type,
+        a_type,
+        b_type,
+        a_scales_type,
+        b_scales_type,
+        type_of(a).layout,
+        type_of(b).layout,
+        type_of(c).layout,
+        type_of(a_scales).layout,
+        type_of(b_scales).layout,
+        SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+    ]
+    ctx.enqueue_function[kernel](
+        c,
+        a,
+        b,
+        a_scales,
+        b_scales,
+        alpha,
+        grid_dim=(ceildiv(N, 8), ceildiv(M, 16), 1),
+        block_dim=(32, 1, 1),
+    )
+
+
 def block_scaled_matmul[
     c_type: DType,
     a_type: DType,
@@ -1859,20 +2045,53 @@ def block_scaled_matmul[
         comptime assert (
             elementwise_compute_lambda_fn is None
         ), "compute-lambda epilogue not supported on the sm_121 NVFP4 path"
-        naive_block_scaled_matmul[
-            scaling_kind = UMMAKind.KIND_MXF4NVF4,
-            SF_VECTOR_SIZE=SF_VECTOR_SIZE,
-            transpose_b=transpose_b,
-            elementwise_lambda_fn=elementwise_lambda_fn,
-        ](
-            c.to_layout_tensor(),
-            a.to_layout_tensor(),
-            b.to_layout_tensor(),
-            a_scales.to_layout_tensor(),
-            b_scales.to_layout_tensor(),
-            ctx,
-            tensor_sf,
-        )
+        # Fused-epilogue cases must use the naive kernel (the TC kernel has no
+        # epilogue support yet) — decided at compile time.
+        comptime if elementwise_lambda_fn:
+            naive_block_scaled_matmul[
+                scaling_kind = UMMAKind.KIND_MXF4NVF4,
+                SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+                transpose_b=transpose_b,
+                elementwise_lambda_fn=elementwise_lambda_fn,
+            ](
+                c.to_layout_tensor(),
+                a.to_layout_tensor(),
+                b.to_layout_tensor(),
+                a_scales.to_layout_tensor(),
+                b_scales.to_layout_tensor(),
+                ctx,
+                tensor_sf,
+            )
+        else:
+            # Default: our native FP4 tensor-core kernel. Set MAX_FP4_NAIVE=1 to
+            # select the CUDA-core naive kernel at runtime (A/B validation).
+            if getenv("MAX_FP4_NAIVE", "0") != "0":
+                naive_block_scaled_matmul[
+                    scaling_kind = UMMAKind.KIND_MXF4NVF4,
+                    SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+                    transpose_b=transpose_b,
+                ](
+                    c.to_layout_tensor(),
+                    a.to_layout_tensor(),
+                    b.to_layout_tensor(),
+                    a_scales.to_layout_tensor(),
+                    b_scales.to_layout_tensor(),
+                    ctx,
+                    tensor_sf,
+                )
+            else:
+                tc_block_scaled_matmul[
+                    SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+                    transpose_b=transpose_b,
+                ](
+                    c.to_layout_tensor(),
+                    a.to_layout_tensor(),
+                    b.to_layout_tensor(),
+                    a_scales.to_layout_tensor(),
+                    b_scales.to_layout_tensor(),
+                    ctx,
+                    tensor_sf,
+                )
     else:
         comptime assert False, (
             "block_scaled_matmul is only supported on SM100 (B200) or"

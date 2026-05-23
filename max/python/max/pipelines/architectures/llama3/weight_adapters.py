@@ -76,6 +76,34 @@ def _convert_safetensor_with_model_config(
                     supported_encoding_dtype(cast_to)
                 )
 
+    # compressed-tensors stores the per-tensor NVFP4 global scales as DIVISORS
+    # (i.e. 1/scale), whereas MAX's float4 matmul uses the modelopt convention
+    # (scale applied directly). Reciprocate the global scales for CT NVFP4 so the
+    # magnitudes are correct. (See vLLM compressed_tensors_w4a4_nvfp4: "CT stores
+    # as divisors, i.e. 1/scale".) Per-group (block) scales are left untouched.
+    _qc = getattr(huggingface_config, "quantization_config", None)
+    if (
+        isinstance(_qc, dict)
+        and _qc.get("quant_method") == "compressed-tensors"
+        and "nvfp4" in str(_qc.get("format", "")).lower()
+    ):
+        # CT names the per-tensor globals weight_global_scale / input_global_scale
+        # and stores them as divisors; MAX's float4 matmul consumes weight_scale_2
+        # / input_scale as direct multipliers. Rename + reciprocate.
+        _n_recip = 0
+        for key, weight_data in list(new_state_dict.items()):
+            if key.endswith("weight_global_scale"):
+                newkey = key[: -len("weight_global_scale")] + "weight_scale_2"
+            elif key.endswith("input_global_scale"):
+                newkey = key[: -len("input_global_scale")] + "input_scale"
+            else:
+                continue
+            arr = np.from_dlpack(weight_data.data)
+            recip = (1.0 / arr.astype(np.float32)).astype(arr.dtype)
+            new_state_dict[newkey] = WeightData.from_numpy(recip, newkey)
+            _n_recip += 1
+        print(f"CTRECIP2 renamed+reciprocated={_n_recip}", flush=True)
+
     # The GPTQ algorithm only use a subset of its keys based on the specific
     # configuration, while the unused keys remain present in the state dict
     # but are filled with dummy values for compatibility reasons. We have

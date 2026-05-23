@@ -54,13 +54,29 @@ class MemoryEstimator:
     def free_memory(cls, devices: list[Device]) -> int:
         """Returns the total free memory available across all provided devices."""
         try:
-            return int(sum(d.stats["free_memory"] for d in devices))
+            total = int(sum(d.stats["free_memory"] for d in devices))
         except Exception as e:
             logger.warning(
                 "Unable to estimate memory footprint of model, can't query device stats: "
                 + str(e)
             )
             raise
+        # On unified-memory devices (e.g. DGX Spark / GB10) the driver reports
+        # the entire system RAM as "free device memory", so MAX over-reserves KV
+        # workspace and starves the host (OOM on otherwise-fitting models).
+        # MAX_DEVICE_FREE_MEMORY_GB lets the operator cap the reported value.
+        import os
+
+        cap_gb = os.environ.get("MAX_DEVICE_FREE_MEMORY_GB")
+        if cap_gb:
+            cap = int(float(cap_gb) * (1024**3))
+            if 0 < cap < total:
+                logger.info(
+                    f"Capping reported free device memory {total} -> {cap} "
+                    "bytes (MAX_DEVICE_FREE_MEMORY_GB)"
+                )
+                total = cap
+        return total
 
     @classmethod
     def static_memory_size(

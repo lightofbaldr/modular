@@ -200,7 +200,14 @@ class Llama3(Transformer):
         # Create Embedding and output layers.
         embedding_output_dtype = config.dtype
         embedding_output_quantization = config.model_quantization_encoding
-        if config.model_quantization_encoding == QuantizationEncoding.GPTQ:
+        # GPTQ, and FP4 (NVFP4/MXFP4 — signalled by a uint8 packed weight dtype
+        # with no GGUF-style encoding) keep the embedding + lm_head unquantized:
+        # they're in the quantization `ignore` list, only the transformer Linear
+        # layers are FP4-packed.
+        if config.model_quantization_encoding == QuantizationEncoding.GPTQ or (
+            config.dtype == DType.uint8
+            and config.model_quantization_encoding is None
+        ):
             embedding_output_dtype = DType.bfloat16
             embedding_output_quantization = None
         if config.quant_config and config.quant_config.embedding_output_dtype:
